@@ -19,7 +19,95 @@ import argparse
 
 data_dir = "test_assets"
 
+# ==============================================================================
+# 1. 配置区域: 定义所有常量和输入数据
+# ==============================================================================
 
+# 定义每个指标的归一化范围 [最好值, 最差值]
+# --- 唯一的改动在这里 ---
+METRIC_BOUNDS = {
+    # Video
+    'AS': {'best': 1.0, 'worst': 0.0},
+    'ID': {'best': 1.0, 'worst': 0.0},
+    # Audio
+    'FD': {'best': 0.0, 'worst': 3.0},
+    'KL': {'best': 0.0, 'worst': 4.0},
+    'CS': {'best': 1.0, 'worst': 0.0},
+    'CE': {'best': 10.0, 'worst': 1.0},
+    'CU': {'best': 10.0, 'worst': 1.0},
+    'PC': {'best': 1.0, 'worst': 10.0},
+    'PQ': {'best': 10.0, 'worst': 1.0},
+    # TTS
+    'WER': {'best': 0.0, 'worst': 1.0},
+    # Audio-Video
+    'LSE-C': {'best': 10.0, 'worst': 0.0},  # 将上限从 7.0 修改为 10.0
+    'AV-A': {'best': 0.0, 'worst': 1.0},
+}
+
+# 定义哪些指标是“越大越好”
+HIGHER_IS_BETTER_METRICS = {'AS', 'ID', 'CS', 'CE', 'CU', 'PQ', 'LSE-C'}
+
+# 定义四个子分数的权重
+WEIGHTS = {
+    'joint': 0.5,
+    'video': 0.2,
+    'audio': 0.2,
+    'other': 0.1
+}
+
+
+# ==============================================================================
+# 2. 核心计算函数 (无需改动)
+# ==============================================================================
+
+def normalize_metric(metric_name, value):
+    """根据预定义的范围和趋势，归一化单个指标值。"""
+    bounds = METRIC_BOUNDS[metric_name]
+    best, worst = bounds['best'], bounds['worst']
+
+    if best == worst:
+        return 0.5
+
+    if metric_name in HIGHER_IS_BETTER_METRICS:
+        norm_score = (value - worst) / (best - worst)
+    else:
+        norm_score = (worst - value) / (worst - best)
+
+    return max(0, min(1, norm_score))
+
+
+def calculate_overall_score(metrics):
+    """计算单个方法的所有子分数和最终总分。"""
+    normalized_scores = {name: normalize_metric(name, val) for name, val in metrics.items()}
+
+    s_video = (normalized_scores['AS'] + normalized_scores['ID']) / 2
+
+    audio_metrics = ['FD', 'KL', 'CS', 'CE', 'CU', 'PC', 'PQ']
+    s_audio = sum(normalized_scores[m] for m in audio_metrics) / len(audio_metrics)
+
+    s_other = (normalized_scores['WER'] + normalized_scores['LSE-C']) / 2
+
+    cs_norm = normalized_scores['CS']
+    av_a_norm = normalized_scores['AV-A']
+    if (cs_norm + av_a_norm) == 0:
+        s_joint = 0
+    else:
+        s_joint = 2 * (cs_norm * av_a_norm) / (cs_norm + av_a_norm)
+
+    overall_score = (
+            WEIGHTS['joint'] * s_joint +
+            WEIGHTS['video'] * s_video +
+            WEIGHTS['audio'] * s_audio +
+            WEIGHTS['other'] * s_other
+    )
+
+    return {
+        "S_joint": s_joint,
+        "S_video": s_video,
+        "S_audio": s_audio,
+        "S_other": s_other,
+        "Overall Score": overall_score
+    }
 
 
 def evaluate_aesthetic_video(video_path, aesthetic_inferencer, musiq_inferencer, manica_inferencer):
@@ -111,7 +199,6 @@ def calculate_metrics(input_dir,  modes_path, sets_root):
     total_wer = []
     total_ava = []
     total_lse_c = []
-    total_ms = []
     total_id = []
     for file in os.listdir(f"{sets_root}/{sez}"):
         if file.endswith(".json"):
@@ -131,9 +218,6 @@ def calculate_metrics(input_dir,  modes_path, sets_root):
                     sync_score = syncnet_inferencer.infer(video_path)[1]
                     if sync_score is not None:
                         total_lse_c.append(sync_score)
-                flow_score = evaluate_raft_video(video_path, raft_inferencer)
-                if flow_score is not None:
-                    total_ms.append(flow_score)
                 dinov3_score = evaluate_dinov3_video(video_path, dinov3_inferencer,
                                                      f"{sets_root}/{sez}/{base_name}.jpg")
                 total_id.append(dinov3_score)
@@ -170,9 +254,6 @@ def calculate_metrics(input_dir,  modes_path, sets_root):
                     sync_score = syncnet_inferencer.infer(video_path)[1]
                     if sync_score is not None:
                         total_lse_c.append(sync_score)
-                flow_score = evaluate_raft_video(video_path, raft_inferencer)
-                if flow_score is not None:
-                    total_ms.append(flow_score)
                 dinov3_score = evaluate_dinov3_video(video_path, dinov3_inferencer,
                                                      f"{sets_root}/{sez}/{base_name}.jpg")
                 total_id.append(dinov3_score)
@@ -211,9 +292,6 @@ def calculate_metrics(input_dir,  modes_path, sets_root):
                     sync_score = syncnet_inferencer.infer(video_path)[1]
                     if sync_score is not None:
                         total_lse_c.append(sync_score)
-                flow_score = evaluate_raft_video(video_path, raft_inferencer)
-                if flow_score is not None:
-                    total_ms.append(flow_score)
                 dinov3_score = evaluate_dinov3_video(video_path, dinov3_inferencer,
                                                      f"{sets_root}/{sez}/{base_name}.jpg")
                 total_id.append(dinov3_score)
@@ -233,26 +311,26 @@ def calculate_metrics(input_dir,  modes_path, sets_root):
     wer = sum(total_wer) / len(total_wer) if len(total_wer) > 0 else -999
     ava = sum(total_ava) / len(total_ava) if len(total_ava) > 0 else -999
     lse_c = sum(total_lse_c) / len(total_lse_c) if len(total_lse_c) > 0 else -999
-    ms = sum(total_ms) / len(total_ms) if len(total_ms) > 0 else -999
     avg_aesthetic = sum(total_aesthetic) / len(total_aesthetic) if len(total_aesthetic) > 0 else -999
     avg_musiq = sum(total_musiq) / len(total_musiq) if len(total_musiq) > 0 else -999
     avg_maniqa = sum(total_maniqa) / len(total_maniqa) if len(total_maniqa) > 0 else -999
     avg_as = (avg_aesthetic + avg_musiq + avg_maniqa) / 3.0 if (avg_aesthetic!=-999 and avg_musiq!=-999 and avg_maniqa!=-999) else -999
-    return {
-        "ms": ms,
-        "as": avg_as,
-        "id": id_score,
-        "fd":fd,
-        "kl":kl,
-        "cs":cs,
-        "ce":ce,
-        "cu":cu,
-        "pc":pc,
-        "pq":pq,
-        "wer":wer,
-        "lse_c":lse_c,
-        "ava":ava,
+    scores_dict = {
+        "AS": avg_as,
+        "ID": id_score,
+        "FD":fd,
+        "KL":kl,
+        "CS":cs,
+        "CE":ce,
+        "CU":cu,
+        "PC":pc,
+        "PQ":pq,
+        "WER":wer,
+        "LSE-C":lse_c,
+        "AV-A":ava,
     }
+    overall_score = calculate_overall_score(scores_dict)
+    return scores_dict, overall_score
 
 
 if __name__ == '__main__':
@@ -266,5 +344,6 @@ if __name__ == '__main__':
         os.environ['MODELS_PATH'] = models_path
 
     args = parser.parse_args()
-    metrics = calculate_metrics(args.input_dir, models_path, args.verse_bench_dir)
-    print(metrics)
+    scores_dict, overall_score = calculate_metrics(args.input_dir, models_path, args.verse_bench_dir)
+    print(scores_dict)
+    print(overall_score)
